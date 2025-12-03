@@ -1,0 +1,119 @@
+#!/bin/bash
+
+show_usage() {
+    echo "Usage: $0 -d <domain> [-l <limit>] [-e]"
+    echo " -d    Domain to enumerate"
+    echo " -l    Limit for crt (default 1000)"
+    echo " -e    Exclude expired certificates"
+    exit 1
+}
+
+DOMAIN=""
+LIMIT="1000"
+EXCLUDE_EXPIRED=""
+
+while getopts "d:l:e" opt; do
+    case $opt in
+        d) DOMAIN="$OPTARG" ;;
+        l) LIMIT="$OPTARG" ;;
+        e) EXCLUDE_EXPIRED="-e" ;;
+        *) show_usage ;;
+    esac
+done
+
+if [ -z "$DOMAIN" ]; then
+    show_usage
+fi
+
+BASE_DOMAIN="${DOMAIN%%.*}"
+DB_FILE="${BASE_DOMAIN}_footprint.db"
+
+WORKDIR=$(mktemp -d)
+SUBS_CSV="$WORKDIR/subs.csv"
+RESOLVED_FILE="$WORKDIR/resolved.csv"
+IPS_ONLY="$WORKDIR/ips.txt"
+NRICH_JSON="$WORKDIR/nrich.json"
+
+echo "Running crt"
+crt -csv -o "$SUBS_CSV" -l "$LIMIT" $EXCLUDE_EXPIRED "$DOMAIN"
+
+if [ ! -s "$SUBS_CSV" ]; then
+    echo "crt failed to produce output. Certificate authority could not be contacted."
+    exit 1
+fi
+
+echo "Extracting domains with regex"
+grep -Eo "([a-zA-Z0-9][a-zA-Z0-9\-]*\.)+$DOMAIN" "$SUBS_CSV" \
+    | sort -u \
+    > "$WORKDIR/subdomains.txt"
+
+if [ ! -s "$WORKDIR/subdomains.txt" ]; then
+    echo "No domains detected. Exiting."
+    exit 1
+fi
+
+echo "Resolving domains"
+> "$RESOLVED_FILE"
+while IFS= read -r D; do
+    if [ -n "$D" ]; then
+        IPS=$(dig "$D" A +short)
+        if [ -n "$IPS" ]; then
+            for IP in $IPS; do
+                echo "$D,$IP" >> "$RESOLVED_FILE"
+            done
+        fi
+    fi
+done < "$WORKDIR/subdomains.txt"
+
+if [ ! -s "$RESOLVED_FILE" ]; then
+    echo "No IP addresses found. Exiting."
+    exit 1
+fi
+
+echo "Extracting IPs with regex"
+grep -Eo '([0-9]{1,3}\.){3}[0-9]{1,3}' "$RESOLVED_FILE" \
+    | sort -u \
+    > "$IPS_ONLY"
+
+if [ ! -s "$IPS_ONLY" ]; then
+    echo "No valid IPs extracted. Exiting."
+    exit 1
+fi
+
+echo "Running nrich"
+nrich -o json "$IPS_ONLY" > "$NRICH_JSON"
+
+if [ ! -s "$NRICH_JSON" ]; then
+    echo "nrich failed to produce JSON."
+    exit 1
+fi
+
+echo "Preparing sqlite database"
+sqlite3 "$DB_FILE" <<EOF
+DROP TABLE IF EXISTS hosts;
+CREATE TABLE hosts (
+    domain TEXT,
+    ip_address TEXT,
+    vuln_data TEXT
+);
+EOF
+
+echo "Inserting data into database"
+while IFS= read -r LINE; do
+    DOMAIN_NAME=$(echo "$LINE" | grep -Eo '([a-zA-Z0-9][a-zA-Z0-9\-]*\.)+[a-zA-Z]{2,}')
+    IP_ADDR=$(echo "$LINE" | grep -Eo '([0-9]{1,3}\.){3}[0-9]{1,3}')
+
+    if [ -n "$DOMAIN_NAME" ] && [ -n "$IP_ADDR" ]; then
+        VULN_JSON=$(jq -c --arg ip "$IP_ADDR" '.[] | select(.ip == $ip)' "$NRICH_JSON")
+
+        sqlite3 "$DB_FILE" <<EOF
+INSERT INTO hosts (domain, ip_address, vuln_data)
+VALUES ('$DOMAIN_NAME', '$IP_ADDR', '$VULN_JSON');
+EOF
+    fi
+
+done < "$RESOLVED_FILE"
+
+echo "Done"
+echo "Database created: $DB_FILE"
+echo "Temporary working files are in $WORKDIR"
